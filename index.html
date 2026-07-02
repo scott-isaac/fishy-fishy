@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Fishy Fishy!</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden;
+    background: #0a2a4a;
+    -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: none;
+    font-family: "Comic Sans MS", "Chalkboard SE", "Segoe UI", system-ui, sans-serif;
+  }
+  #wrap { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(function () {
+  "use strict";
+
+  // ---- Logical resolution (we draw in these coords; CSS scales to fit) ----
+  const W = 1600, H = 1000;
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d");
+
+  function fit() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    canvas.style.width = Math.round(W * scale) + "px";
+    canvas.style.height = Math.round(H * scale) + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  window.addEventListener("resize", fit);
+  fit();
+
+  // ---------------------------------------------------------------------------
+  //  Catch pools by depth. Deeper lanes = more points. Junk is funny + cheap,
+  //  King Crab / treasure on the seafloor is the jackpot.
+  // ---------------------------------------------------------------------------
+  const POOLS = {
+    shallow:  [ ["🐠","Clownfish",10,74], ["🐟","Minnow",10,66], ["🐠","Angelfish",15,74] ],
+    shallow2: [ ["🐡","Pufferfish",20,80], ["🐠","Guppy",15,66], ["🐟","Sardine",10,64] ],
+    mid:      [ ["🐟","Tuna",30,92], ["🦑","Squid",40,88], ["🐠","Parrotfish",35,80] ],
+    mid2:     [ ["🐡","Blowfish",35,86], ["🐟","Mackerel",25,80], ["🦐","Shrimp",30,70] ],
+    deep:     [ ["🦈","Shark",60,120], ["🐙","Octopus",55,100], ["🐬","Dolphin",65,110] ],
+    junk:     [ ["👟","old Shoe",5,66], ["🎩","Top Hat",5,66], ["💀","Skull",5,66],
+                ["🥫","Tin Can",5,60], ["🍾","Bottle",5,64], ["👢","old Boot",5,66],
+                ["🥾","Hiking Boot",5,66] ],
+    treasure: [ ["🦀","King Crab",100,110], ["🦞","Lobster",80,110], ["💎","Diamond",150,80] ],
+  };
+
+  // Lanes: yFrac (fraction of H), direction, speed px/s, pool, count.
+  const LANES = [
+    { y: 0.40, dir:  1, speed: 55, pool: "shallow",  count: 4 },
+    { y: 0.475, dir: -1, speed: 70, pool: "shallow2", count: 4 },
+    { y: 0.55, dir:  1, speed: 52, pool: "mid",      count: 3 },
+    { y: 0.63, dir: -1, speed: 82, pool: "mid2",     count: 3 },
+    { y: 0.71, dir:  1, speed: 46, pool: "deep",     count: 2 },
+    { y: 0.80, dir: -1, speed: 34, pool: "junk",     count: 4 },
+    { y: 0.885, dir: 1, speed: 22, pool: "treasure", count: 2 },
+  ];
+
+  const WATER_Y = H * 0.31;         // waterline
+  const REST_Y  = H * 0.245;        // hook resting depth (just under boat)
+  const PIVOT_Y = H * 0.135;        // height of each rod tip
+  const PIVOT_X = [W * 0.26, W * 0.74]; // left boat, right boat
+  const MAX_DEPTH = H * 0.95;
+
+  // ---------------------------------------------------------------------------
+  //  Fish entities
+  // ---------------------------------------------------------------------------
+  const fishes = [];
+
+  function pick(pool) {
+    const arr = POOLS[pool];
+    return arr[(Math.random() * arr.length) | 0];
+  }
+
+  function spawnFish(lane, atEdge) {
+    const it = pick(lane.pool);
+    const size = it[3];
+    const dir = lane.dir;
+    const speed = lane.speed * (0.8 + Math.random() * 0.5);
+    let x;
+    if (atEdge) x = dir > 0 ? -size : W + size;
+    else x = Math.random() * W;
+    return {
+      emoji: it[0], name: it[1], points: it[2], size,
+      x, y: lane.y * H + (Math.random() * 24 - 12),
+      vx: speed * dir, dir,
+      bob: Math.random() * Math.PI * 2,
+      lane,
+      caught: false,
+    };
+  }
+
+  function initFish() {
+    fishes.length = 0;
+    for (const lane of LANES) {
+      const spacing = W / lane.count;
+      for (let i = 0; i < lane.count; i++) {
+        const f = spawnFish(lane, false);
+        f.x = i * spacing + Math.random() * spacing * 0.5;
+        fishes.push(f);
+      }
+    }
+  }
+  initFish();
+
+  // ---------------------------------------------------------------------------
+  //  Players (two boats, two hooks)
+  // ---------------------------------------------------------------------------
+  const ROPE_LEN = REST_Y - PIVOT_Y;   // fixed length while swinging
+  const MAX_ANGLE = 0.78;              // widest swing angle from vertical (~45°)
+  const SWING_W = 1.15;                // base radians/s of the swing oscillation
+  const DROP_SPEED = 760;
+  const REEL_SPEED = 470;
+  const ROUND_TIME = 60;               // seconds of fishing per round
+
+  function makePlayer(i) {
+    return {
+      id: i,
+      px: PIVOT_X[i],           // pivot (rod tip) position
+      py: PIVOT_Y,
+      state: "swing",           // swing | drop | reel
+      phase: Math.random() * Math.PI * 2,        // random start so they aren't in sync
+      swingW: SWING_W * (0.88 + Math.random() * 0.24), // slightly different swing speeds
+      angle: 0,                 // swing angle from vertical; frozen while cast
+      len: ROPE_LEN,            // line length from pivot to hook
+      tipX: PIVOT_X[i],
+      tipY: REST_Y,
+      caught: null,
+      tickets: 0,
+      banner: { t: 0, name: "", emoji: "", pts: 0 },
+      sail: i === 0 ? "#e23b3b" : "#2fa84f", // red left, green right
+    };
+  }
+  const players = [makePlayer(0), makePlayer(1)];
+
+  // Shared round state — both boats start together and race the same clock.
+  const game = {
+    state: "idle",   // idle | countdown | playing | over
+    countT: 0,       // countdown remaining (3..0)
+    lastCount: 0,    // for one beep per number
+    timeLeft: 0,     // playing time remaining
+    goT: 0,          // "GO!" flash timer
+  };
+
+  // Recompute a hook tip from its pivot, current angle and line length.
+  function updateTip(p) {
+    p.tipX = p.px + Math.sin(p.angle) * p.len;
+    p.tipY = p.py + Math.cos(p.angle) * p.len;
+  }
+  players.forEach(updateTip);
+
+  // ---------------------------------------------------------------------------
+  //  Audio (tiny synth, unlocked on first interaction)
+  // ---------------------------------------------------------------------------
+  let AC = null, muted = false;
+  function audio() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    return AC;
+  }
+  function beep(freq, dur, type, vol) {
+    if (muted) return;
+    const ac = audio(); if (!ac) return;
+    const o = ac.createOscillator(), g = ac.createGain();
+    o.type = type || "sine"; o.frequency.value = freq;
+    g.gain.value = vol == null ? 0.14 : vol;
+    o.connect(g); g.connect(ac.destination);
+    const now = ac.currentTime;
+    g.gain.setValueAtTime(g.gain.value, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    o.start(now); o.stop(now + dur);
+  }
+  function sndSplash(){ beep(220,0.18,"sine",0.10); setTimeout(()=>beep(160,0.16,"sine",0.08),40); }
+  function sndCatch(){ beep(660,0.10,"square",0.10); setTimeout(()=>beep(880,0.12,"square",0.10),90); setTimeout(()=>beep(1180,0.16,"square",0.10),190); }
+  function sndMiss(){ beep(200,0.18,"sawtooth",0.06); }
+
+  // ---------------------------------------------------------------------------
+  //  Input
+  // ---------------------------------------------------------------------------
+  // First press (by either player) starts/restarts the shared round; later presses cast.
+  function dropInput(i) {
+    if (game.state === "idle" || game.state === "over") { startRound(); return; }
+    if (game.state !== "playing") return;            // still counting down
+    const p = players[i];
+    // A player may only cast when their hook is idle AND their catch toast is gone.
+    if (p.state === "swing" && p.banner.t <= 0) startDrop(p);
+  }
+  function startRound() {
+    game.state = "countdown";
+    game.countT = 3;
+    game.lastCount = 4;
+    game.goT = 0;
+    for (const p of players) {
+      p.tickets = 0; p.banner.t = 0; p.caught = null;
+      p.state = "swing"; p.len = ROPE_LEN;
+    }
+  }
+  function startDrop(p) {
+    p.state = "drop";   // splash is spawned when the hook actually hits the water
+  }
+
+  function toLocal(clientX, clientY) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (clientX - r.left) / r.width * W,
+      y: (clientY - r.top) / r.height * H,
+    };
+  }
+  function onPress(clientX, clientY) {
+    const q = toLocal(clientX, clientY);
+    // mute button hit-test (top-center)
+    if (Math.abs(q.x - W / 2) < 34 && q.y < 78) { muted = !muted; if (!muted) beep(700,0.08,"sine",0.1); return; }
+    // tap on a boat / fisherman casts that boat's line (generous target for little fingers)
+    for (const p of players) {
+      if (Math.abs(q.x - p.px) < 180 && q.y < H * 0.30) { dropInput(p.id); return; }
+    }
+  }
+
+  canvas.addEventListener("pointerdown", (e) => { e.preventDefault(); onPress(e.clientX, e.clientY); }, { passive: false });
+  window.addEventListener("keydown", (e) => {
+    if (e.repeat) return;
+    // Left boat (P1): Space.   Right boat (P2): Enter / numpad Enter.
+    if (["Space", "ArrowLeft", "KeyA"].includes(e.code)) { e.preventDefault(); dropInput(0); }
+    else if (["Enter", "NumpadEnter", "ArrowRight", "KeyL"].includes(e.code)) { e.preventDefault(); dropInput(1); }
+    else if (e.code === "KeyM") muted = !muted;
+  });
+
+  // ---------------------------------------------------------------------------
+  //  Update
+  // ---------------------------------------------------------------------------
+  const BANNER_TIME = 2.6;
+
+  function update(dt) {
+    // fish movement
+    for (const f of fishes) {
+      if (f.caught) continue;
+      f.x += f.vx * dt;
+      f.bob += dt * 2;
+      const s = f.size;
+      if (f.dir > 0 && f.x > W + s) recycle(f);
+      else if (f.dir < 0 && f.x < -s) recycle(f);
+    }
+
+    // shared round timing
+    if (game.goT > 0) game.goT -= dt;
+    if (game.state === "countdown") {
+      game.countT -= dt;
+      const cur = Math.ceil(game.countT);
+      if (cur !== game.lastCount && cur >= 1) { game.lastCount = cur; beep(560, 0.14, "sine", 0.12); }
+      if (game.countT <= 0) { game.state = "playing"; game.timeLeft = ROUND_TIME; game.goT = 0.8; beep(880, 0.22, "square", 0.13); }
+    } else if (game.state === "playing") {
+      game.timeLeft -= dt;
+      if (game.timeLeft <= 0) { game.timeLeft = 0; game.state = "over"; beep(300, 0.5, "sawtooth", 0.12); }
+    }
+
+    for (const p of players) {
+      if (p.banner.t > 0) p.banner.t -= dt;
+
+      if (p.state === "swing") {
+        // fixed-length pendulum: the hook swings in an arc, angle drives the aim
+        p.phase += p.swingW * dt;
+        p.angle = Math.sin(p.phase) * MAX_ANGLE;
+        p.len = ROPE_LEN;
+        updateTip(p);
+      } else if (p.state === "drop") {
+        // angle is frozen; the line pays out straight along that angle
+        const prevY = p.tipY;
+        p.len += DROP_SPEED * dt;
+        updateTip(p);
+        if (prevY < WATER_Y && p.tipY >= WATER_Y) spawnSplash(p.tipX); // enter water
+        const hit = findCatch(p);
+        if (hit) {
+          hit.caught = true;
+          p.caught = hit;
+          p.state = "reel";
+        } else if (p.tipY >= MAX_DEPTH) {
+          p.state = "reel";
+          sndMiss();
+        }
+      } else if (p.state === "reel") {
+        const prevY = p.tipY;
+        p.len -= REEL_SPEED * dt;
+        if (p.len < ROPE_LEN) p.len = ROPE_LEN;
+        updateTip(p);
+        if (prevY >= WATER_Y && p.tipY < WATER_Y) spawnSplash(p.tipX); // exit water
+        if (p.caught) {
+          // carry the fish just below the hook, along the line's direction
+          p.caught.x = p.tipX + Math.sin(p.angle) * p.caught.size * 0.42;
+          p.caught.y = p.tipY + Math.cos(p.angle) * p.caught.size * 0.42;
+        }
+        if (p.len <= ROPE_LEN) {
+          if (p.caught) {
+            const c = p.caught;
+            p.tickets += c.points;
+            p.banner.t = BANNER_TIME; p.banner.name = c.name;
+            p.banner.emoji = c.emoji; p.banner.pts = c.points;
+            sndCatch();
+            recycle(c);            // send a fresh fish back into its lane
+            p.caught = null;
+          }
+          // Back to swinging; dropInput() stays blocked until the toast expires.
+          p.state = "swing";
+        }
+      }
+    }
+  }
+
+  function recycle(f) {
+    // respawn this fish fresh at the entering edge of its lane
+    const lane = f.lane;
+    const it = pick(lane.pool);
+    f.emoji = it[0]; f.name = it[1]; f.points = it[2]; f.size = it[3];
+    f.dir = lane.dir;
+    f.vx = lane.speed * (0.8 + Math.random() * 0.5) * lane.dir;
+    f.x = lane.dir > 0 ? -f.size : W + f.size;
+    f.y = lane.y * H + (Math.random() * 24 - 12);
+    f.caught = false;
+  }
+
+  function findCatch(p) {
+    const catchR = 34;
+    let best = null, bestY = -Infinity;
+    for (const f of fishes) {
+      if (f.caught) continue;
+      const dx = Math.abs(f.x - p.tipX);
+      const dy = Math.abs(f.y - p.tipY);
+      if (dx < f.size * 0.5 + catchR && dy < f.size * 0.45 + catchR) {
+        // choose the one whose center is nearest the descending tip
+        if (f.y > bestY) { best = f; bestY = f.y; }
+      }
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Render
+  // ---------------------------------------------------------------------------
+  let cloudX = 0;
+  const bubbles = [];
+  for (let i = 0; i < 34; i++) bubbles.push({ x: Math.random()*W, y: WATER_Y + Math.random()*(H-WATER_Y), r: 3+Math.random()*10, s: 12+Math.random()*26 });
+
+  // Splash droplets + expanding surface ripples, spawned when a hook hits the water.
+  const ripples = [];   // { x, t, life, maxR }
+  const drops = [];     // { x, y, vx, vy, t, life }
+  function spawnSplash(x) {
+    ripples.push({ x, t: 0, life: 0.9,  maxR: 70 });
+    ripples.push({ x, t: -0.12, life: 1.05, maxR: 115 });
+    const n = 9 + (Math.random() * 4 | 0);
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI / 2 + (Math.random() - 0.5) * 1.7;
+      const sp = 130 + Math.random() * 230;
+      drops.push({ x, y: WATER_Y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, life: 0.45 + Math.random() * 0.35 });
+    }
+    sndSplash();
+  }
+  function updateEffects(dt) {
+    for (let i = ripples.length - 1; i >= 0; i--) {
+      const r = ripples[i]; r.t += dt;
+      if (r.t >= r.life) ripples.splice(i, 1);
+    }
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i]; d.t += dt;
+      d.vy += 1100 * dt;                 // gravity
+      d.x += d.vx * dt; d.y += d.vy * dt;
+      if (d.t >= d.life || d.y > WATER_Y + 4) drops.splice(i, 1);
+    }
+  }
+  function drawEffects() {
+    // ripples sit on the water surface (flattened rings)
+    for (const r of ripples) {
+      if (r.t < 0) continue;
+      const k = r.t / r.life;
+      const rad = 8 + r.maxR * k;
+      ctx.save();
+      ctx.globalAlpha = (1 - k) * 0.6;
+      ctx.strokeStyle = "#eaffff"; ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.ellipse(r.x, WATER_Y, rad, rad * 0.28, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
+    // droplets
+    ctx.fillStyle = "#cdeeff";
+    for (const d of drops) {
+      ctx.globalAlpha = Math.max(0, 1 - d.t / d.life);
+      ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawBackground(dt) {
+    // sky
+    let g = ctx.createLinearGradient(0, 0, 0, WATER_Y);
+    g.addColorStop(0, "#8fd6ff"); g.addColorStop(1, "#d6f2ff");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, WATER_Y);
+    // clouds
+    cloudX = (cloudX + dt * 8) % (W + 400);
+    ctx.font = "120px serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.globalAlpha = 0.9;
+    for (let i = 0; i < 4; i++) {
+      const x = ((i * 520 + cloudX) % (W + 400)) - 200;
+      ctx.fillText("☁️", x, 70 + (i % 2) * 30);
+    }
+    ctx.globalAlpha = 1;
+
+    // water
+    g = ctx.createLinearGradient(0, WATER_Y, 0, H);
+    g.addColorStop(0, "#2ba7e0"); g.addColorStop(0.5, "#1a7fc4"); g.addColorStop(1, "#0e5a97");
+    ctx.fillStyle = g; ctx.fillRect(0, WATER_Y, W, H - WATER_Y);
+
+    // sunbeams
+    ctx.save();
+    ctx.globalAlpha = 0.06; ctx.fillStyle = "#ffffff";
+    for (let i = 0; i < 5; i++) {
+      ctx.beginPath();
+      const bx = 200 + i * 300;
+      ctx.moveTo(bx, WATER_Y); ctx.lineTo(bx + 80, WATER_Y);
+      ctx.lineTo(bx + 260, H); ctx.lineTo(bx - 40, H); ctx.closePath(); ctx.fill();
+    }
+    ctx.restore();
+
+    // waterline shimmer
+    ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 4;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 20) {
+      const y = WATER_Y + Math.sin(x * 0.03 + performance.now() * 0.002) * 4;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // bubbles
+    ctx.fillStyle = "rgba(255,255,255,0.25)";
+    for (const b of bubbles) {
+      b.y -= b.s * dt;
+      if (b.y < WATER_Y) { b.y = H + 10; b.x = Math.random() * W; }
+      ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // seafloor sand
+    g = ctx.createLinearGradient(0, H * 0.92, 0, H);
+    g.addColorStop(0, "rgba(240,220,150,0)"); g.addColorStop(1, "rgba(230,205,140,0.85)");
+    ctx.fillStyle = g; ctx.fillRect(0, H * 0.9, W, H * 0.1);
+  }
+
+  function drawBoat(p) {
+    ctx.save();
+    const bx = p.px, by = H * 0.145;
+    const flip = p.id === 1 ? -1 : 1;   // mirror the right-hand boat
+    // hull
+    ctx.fillStyle = "#7a4a24";
+    ctx.beginPath();
+    ctx.moveTo(bx - 130, by);
+    ctx.quadraticCurveTo(bx, by + 70, bx + 130, by);
+    ctx.lineTo(bx + 100, by - 22);
+    ctx.lineTo(bx - 100, by - 22);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#9c6231";
+    ctx.fillRect(bx - 110, by - 26, 220, 10);
+    // mast + sail (mirrored per side)
+    ctx.strokeStyle = "#5c3416"; ctx.lineWidth = 8;
+    ctx.beginPath(); ctx.moveTo(bx, by - 24); ctx.lineTo(bx, by - 150); ctx.stroke();
+    ctx.fillStyle = p.sail;
+    ctx.beginPath();
+    ctx.moveTo(bx + 6 * flip, by - 150);
+    ctx.lineTo(bx + 95 * flip, by - 118);
+    ctx.lineTo(bx + 6 * flip, by - 60);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#fff";
+    for (let i = 0; i < 3; i++) {
+      const w = 60 - i * 8;
+      ctx.fillRect(flip === 1 ? bx + 18 : bx - 18 - w, by - 142 + i * 26, w, 8);
+    }
+    // little fisher, on the casting side
+    ctx.font = "60px serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("🧑‍✈️", bx + 60 * flip, by - 34);
+    ctx.restore();
+  }
+
+  // A real metal fish-hook drawn at the tip, aligned with the line direction.
+  function drawHookShape(x, y, angle) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(-angle);          // local +Y runs parallel to the line, down to the tip
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const draw = (color, width) => {
+      ctx.strokeStyle = color; ctx.lineWidth = width;
+      ctx.beginPath();
+      ctx.moveTo(0, -14);        // eye of the hook (where the line attaches)
+      ctx.lineTo(0, 16);         // shank
+      ctx.arc(-9, 16, 9, 0, Math.PI, false); // the bend (U-turn)
+      ctx.lineTo(-18, 6);        // point coming back up
+      ctx.stroke();
+      // barb
+      ctx.beginPath();
+      ctx.moveTo(-18, 6);
+      ctx.lineTo(-11, 11);
+      ctx.stroke();
+    };
+    draw("#3a4650", 9);          // dark outline
+    draw("#e8eef4", 4);          // bright metal
+    // the eye ring
+    ctx.strokeStyle = "#e8eef4"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, -16, 4, 0, Math.PI * 2); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawFishSprite(f) {
+    const bobY = f.caught ? 0 : Math.sin(f.bob) * 4;
+    ctx.save();
+    ctx.translate(f.x, f.y + bobY);
+    // emoji fish generally face LEFT; flip when swimming right
+    if (f.dir > 0 && !f.caught) ctx.scale(-1, 1);
+    ctx.font = f.size + "px serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(f.emoji, 0, 0);
+    ctx.restore();
+  }
+
+  function drawHook(p) {
+    // line from pivot to the eye of the hook
+    ctx.strokeStyle = "rgba(255,255,255,0.85)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(p.px, p.py); ctx.lineTo(p.tipX, p.tipY); ctx.stroke();
+    drawHookShape(p.tipX, p.tipY, p.angle);
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function ticketBadge(p, x, align) {
+    const w = 250, bx = align === "left" ? x : x - w;
+    ctx.fillStyle = "rgba(0,0,0,0.28)";
+    roundRect(bx, 22, w, 74, 18); ctx.fill();
+    ctx.lineWidth = 4; ctx.strokeStyle = p.sail; ctx.stroke();
+    ctx.fillStyle = "#ffd83b";
+    ctx.font = "bold 26px system-ui, sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText(`🎟️ PLAYER ${p.id + 1}`, bx + 18, 46);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 40px system-ui, sans-serif";
+    ctx.fillText(String(p.tickets), bx + 18, 76);
+    // shared clock on the right side of the badge
+    ctx.textAlign = "right"; ctx.textBaseline = "middle";
+    if (game.state === "playing" || game.state === "countdown") {
+      const secs = game.state === "playing" ? Math.ceil(game.timeLeft) : ROUND_TIME;
+      ctx.fillStyle = (game.state === "playing" && game.timeLeft <= 10) ? "#ff6b6b" : "#bfe9ff";
+      ctx.font = "bold 34px system-ui, sans-serif";
+      ctx.fillText(`⏱ ${secs}`, bx + w - 18, 76);
+    } else if (game.state === "over") {
+      ctx.fillStyle = "#ff6b6b"; ctx.font = "bold 26px system-ui, sans-serif";
+      ctx.fillText("FINAL", bx + w - 18, 76);
+    }
+  }
+
+  function drawHUD() {
+    ticketBadge(players[0], 24, "left");
+    ticketBadge(players[1], W - 24, "right");
+
+    // mute button (top-center)
+    ctx.fillStyle = "rgba(0,0,0,0.28)";
+    roundRect(W / 2 - 34, 22, 68, 56, 16); ctx.fill();
+    ctx.font = "30px serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(muted ? "🔇" : "🔊", W / 2, 51);
+
+    // controls hint
+    const a = 0.5 + Math.sin(performance.now() * 0.006) * 0.35;
+    ctx.fillStyle = `rgba(255,255,255,${a})`;
+    ctx.font = "bold 26px system-ui, sans-serif"; ctx.textBaseline = "middle";
+    ctx.textAlign = "left";  ctx.fillText("◀ P1: tap boat  /  Space", 30, H - 40);
+    ctx.textAlign = "right"; ctx.fillText("Enter  /  tap boat: P2 ▶", W - 30, H - 40);
+  }
+
+  // Per-player catch toast, kept inside that player's half of the screen.
+  function drawBanner(p) {
+    if (p.banner.t <= 0) return;
+    const b = p.banner;
+    const life = BANNER_TIME - b.t;
+    const scale = life < 0.35 ? easeBack(life / 0.35) : 1;
+    const alpha = b.t < 0.5 ? b.t / 0.5 : 1;
+    const cx = p.id === 0 ? W * 0.26 : W * 0.74;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(cx, H * 0.42);
+    ctx.scale(scale * 0.72, scale * 0.72);   // a bit smaller so two fit side by side
+    // panel
+    ctx.fillStyle = "rgba(0,0,0,0.4)";
+    roundRect(-430, -100, 860, 210, 30); ctx.fill();
+    ctx.lineWidth = 8; ctx.strokeStyle = p.sail; ctx.stroke();
+    // emoji
+    ctx.font = "120px serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(b.emoji, -300, 0);
+    // text
+    const art = /^[aeiou]/i.test(b.name) ? "an" : "a";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 46px 'Comic Sans MS', system-ui, sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("You caught", -200, -38);
+    ctx.fillStyle = "#ffe86b";
+    ctx.font = "bold 60px 'Comic Sans MS', system-ui, sans-serif";
+    ctx.fillText(`${art} ${b.name}!`, -200, 22);
+    ctx.fillStyle = "#8affc0";
+    ctx.font = "bold 40px system-ui, sans-serif";
+    ctx.fillText(`+${b.pts} 🎟️`, -200, 78);
+    ctx.restore();
+  }
+  function easeBack(t) { const s = 1.9; return 1 + (s + 1) * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2); }
+
+  // Big 3..2..1 countdown, then a "GO!" flash, centered for both players.
+  function drawCountdown() {
+    if (game.state === "countdown") {
+      const n = Math.max(1, Math.ceil(game.countT));
+      const frac = game.countT - Math.floor(game.countT); // 1 -> 0 within each second
+      const scale = 0.8 + frac * 0.9;                      // pops big then shrinks
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, frac * 2);
+      ctx.translate(W / 2, H * 0.44);
+      ctx.scale(scale, scale);
+      ctx.fillStyle = "#fff"; ctx.strokeStyle = "#0e5a97"; ctx.lineWidth = 10;
+      ctx.font = "bold 260px 'Comic Sans MS', system-ui, sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.strokeText(n, 0, 0); ctx.fillText(n, 0, 0);
+      ctx.restore();
+    } else if (game.goT > 0) {
+      const scale = 1 + (0.8 - game.goT) * 1.2;
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, game.goT * 3);
+      ctx.translate(W / 2, H * 0.44);
+      ctx.scale(scale, scale);
+      ctx.fillStyle = "#ffe86b"; ctx.strokeStyle = "#c85a00"; ctx.lineWidth = 10;
+      ctx.font = "bold 200px 'Comic Sans MS', system-ui, sans-serif";
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.strokeText("GO!", 0, 0); ctx.fillText("GO!", 0, 0);
+      ctx.restore();
+    }
+  }
+
+  // Shared winner screen once the clock runs out (waits for any last catch toast).
+  function drawResult() {
+    if (game.state !== "over") return;
+    if (players[0].banner.t > 0 || players[1].banner.t > 0) return;
+    const [a, b] = players;
+    let title, color;
+    if (a.tickets === b.tickets) { title = "It's a Tie! 🤝"; color = "#ffd83b"; }
+    else { const win = a.tickets > b.tickets ? a : b; title = `Player ${win.id + 1} Wins! 🏆`; color = win.sail; }
+    const pulse = 1 + Math.sin(performance.now() * 0.004) * 0.02;
+    ctx.save();
+    ctx.translate(W / 2, H * 0.44);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    roundRect(-560, -180, 1120, 360, 34); ctx.fill();
+    ctx.lineWidth = 10; ctx.strokeStyle = color; ctx.stroke();
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = color; ctx.font = "bold 90px 'Comic Sans MS', system-ui, sans-serif";
+    ctx.fillText(title, 0, -96);
+    // both scores
+    ctx.font = "bold 54px 'Comic Sans MS', system-ui, sans-serif";
+    ctx.fillStyle = a.sail; ctx.textAlign = "right";
+    ctx.fillText(`P1:  ${a.tickets} 🎟️`, -30, 6);
+    ctx.fillStyle = b.sail; ctx.textAlign = "left";
+    ctx.fillText(`P2:  ${b.tickets} 🎟️`, 30, 6);
+    const blink = 0.5 + Math.sin(performance.now() * 0.006) * 0.4;
+    ctx.fillStyle = `rgba(255,255,255,${blink})`; ctx.font = "bold 34px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("tap a boat / Space / Enter to play again", 0, 118);
+    ctx.restore();
+  }
+
+  // ---------------------------------------------------------------------------
+  //  Main loop
+  // ---------------------------------------------------------------------------
+  let last = performance.now();
+  function frame(now) {
+    let dt = (now - last) / 1000; last = now;
+    if (dt > 0.05) dt = 0.05;   // clamp after tab-switch
+
+    update(dt);
+    updateEffects(dt);
+
+    ctx.clearRect(0, 0, W, H);
+    drawBackground(dt);
+    drawEffects();
+    for (const p of players) drawBoat(p);
+    for (const f of fishes) if (!f.caught) drawFishSprite(f);
+    for (const p of players) {
+      drawHook(p);
+      if (p.caught) drawFishSprite(p.caught);
+    }
+    drawHUD();
+    for (const p of players) drawBanner(p);
+    drawCountdown();
+    drawResult();
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
